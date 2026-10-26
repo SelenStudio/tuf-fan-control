@@ -41,6 +41,8 @@ namespace TufFanControl
         public bool SafetyOverrideEnabled = true;
         public int SafetyTempLimit = 86;
         public int Hysteresis = 3;
+        public int RampMode = 0; // 0=Smooth, 1=Fast, 2=Instant
+        public bool TempSmoothingEnabled = true;
         public int ActivePreset = 0; // 0=ZeroRpm, 1=Silent, 2=Balanced, 3=Turbo, -1=Custom
         public bool RestoreAutoOnExit = true;
         public List<CurvePoint> Curve = new List<CurvePoint>();
@@ -121,6 +123,8 @@ namespace TufFanControl
                 sb.AppendLine("SafetyOverrideEnabled=" + (SafetyOverrideEnabled ? "1" : "0"));
                 sb.AppendLine("SafetyTempLimit=" + SafetyTempLimit);
                 sb.AppendLine("Hysteresis=" + Hysteresis);
+                sb.AppendLine("RampMode=" + RampMode);
+                sb.AppendLine("TempSmoothingEnabled=" + (TempSmoothingEnabled ? "1" : "0"));
                 sb.AppendLine("ActivePreset=" + ActivePreset);
                 sb.AppendLine("RestoreAutoOnExit=" + (RestoreAutoOnExit ? "1" : "0"));
                 List<string> pts = new List<string>();
@@ -155,8 +159,10 @@ namespace TufFanControl
                     else if (k == "ManualGpuPercent" && int.TryParse(v, out iv)) cfg.ManualGpuPercent = Clamp(iv, 0, 100);
                     else if (k == "LinkFans") cfg.LinkFans = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                     else if (k == "SafetyOverrideEnabled") cfg.SafetyOverrideEnabled = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
-                    else if (k == "SafetyTempLimit" && int.TryParse(v, out iv)) cfg.SafetyTempLimit = Clamp(iv, 70, 95);
+                    else if (k == "SafetyTempLimit" && int.TryParse(v, out iv)) cfg.SafetyTempLimit = Clamp(iv, 70, 90);
                     else if (k == "Hysteresis" && int.TryParse(v, out iv)) cfg.Hysteresis = Clamp(iv, 1, 8);
+                    else if (k == "RampMode" && int.TryParse(v, out iv)) cfg.RampMode = Clamp(iv, 0, 2);
+                    else if (k == "TempSmoothingEnabled") cfg.TempSmoothingEnabled = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                     else if (k == "ActivePreset" && int.TryParse(v, out iv)) cfg.ActivePreset = Clamp(iv, -1, 3);
                     else if (k == "RestoreAutoOnExit") cfg.RestoreAutoOnExit = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                     else if (k == "Curve")
@@ -394,6 +400,15 @@ namespace TufFanControl
             }
         }
 
+        // Fast path for ramp steps: assumes manual mode already engaged.
+        private static void WriteDutiesOnly(byte duty0, byte duty1)
+        {
+            WriteReg(0x32, 0);
+            WriteReg(0x35, duty0);
+            WriteReg(0x32, 1);
+            WriteReg(0x35, duty1);
+        }
+
         private static string ReadTelemetryLine()
         {
             if (!OpenDevice())
@@ -471,6 +486,15 @@ namespace TufFanControl
                                 SetManualDuties((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
                             }
                             sw.WriteLine(ReadTelemetryLine());
+                        }
+                        else if (cmd == "DUTY" && parts.Length >= 3)
+                        {
+                            int d0, d1;
+                            if (int.TryParse(parts[1], out d0) && int.TryParse(parts[2], out d1))
+                            {
+                                WriteDutiesOnly((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
+                            }
+                            sw.WriteLine("OKD");
                         }
                         else if (cmd == "KEEP_ON_EXIT" && parts.Length >= 2)
                         {
@@ -641,6 +665,25 @@ namespace TufFanControl
             }
         }
 
+        public bool SendDuty(int d0, int d1)
+        {
+            if (!Connected) return false;
+            lock (_ioLock)
+            {
+                try
+                {
+                    _writer.WriteLine("DUTY " + d0 + " " + d1);
+                    string resp = _reader.ReadLine();
+                    return resp == "OKD";
+                }
+                catch
+                {
+                    Connected = false;
+                    return false;
+                }
+            }
+        }
+
         public void SetKeepOnExit(bool keep)
         {
             if (!Connected) return;
@@ -679,6 +722,9 @@ namespace TufFanControl
 
     public class MainForm : Form
     {
+        // Absolute thermal floor: forces EC Auto no matter what the user configured.
+        private const int HardSafetyTemp = 92;
+
         private readonly AppConfig _cfg;
         private readonly string _cfgPath;
         private readonly EcBridge _ec;
@@ -695,11 +741,22 @@ namespace TufFanControl
         private int _fan1Duty = 0;
         private int _fan1Rpm = 0;
         private bool _safetyTripped = false;
-        private int _lastAppliedDuty0 = -1;
-        private int _lastAppliedDuty1 = -1;
         private int _lastCurveTempAnchor = -100;
         private int _lastCurvePercent = -1;
         private bool _workerBusy = false;
+
+        // Smoothing / ramp state
+        private double _smoothCpu = -1;
+        private double _smoothGpu = -1;
+        private int _targetDuty0 = 0;
+        private int _targetDuty1 = 0;
+        private int _rampDuty0 = 0;
+        private int _rampDuty1 = 0;
+        private int _lastSentDuty0 = -1;
+        private int _lastSentDuty1 = -1;
+        private bool _manualEngaged = false;
+        private DateTime _lastRampUtc = DateTime.MinValue;
+        private System.Windows.Forms.Timer _rampTimer;
 
         // View state: false = Curve View, true = Manual Sliders View
         private bool _showManualTab = false;
@@ -726,6 +783,7 @@ namespace TufFanControl
         // Footer safety hit rects
         private Rectangle _safetyToggleRect;
         private Rectangle _safetySliderRect;
+        private Rectangle _rampPillRect;
         private Rectangle _restoreOnExitRect;
 
         // Mouse / drag state
@@ -780,9 +838,16 @@ namespace TufFanControl
             _ec.SetKeepOnExit(!_cfg.RestoreAutoOnExit);
 
             _pollTimer = new System.Windows.Forms.Timer();
-            _pollTimer.Interval = 1200;
+            _pollTimer.Interval = 600;
             _pollTimer.Tick += delegate { PollAndApplyAsync(false); };
             _pollTimer.Start();
+
+            _rampTimer = new System.Windows.Forms.Timer();
+            _rampTimer.Interval = 200;
+            _rampTimer.Tick += delegate { RampTick(); };
+            _rampTimer.Start();
+
+            _lastRampUtc = DateTime.UtcNow;
 
             PollAndApplyAsync(true);
         }
@@ -842,9 +907,13 @@ namespace TufFanControl
             if (newMode == FanControlMode.Manual) _showManualTab = true;
             else if (newMode == FanControlMode.CustomCurve) _showManualTab = false;
             _safetyTripped = false;
-            _lastAppliedDuty0 = -1;
-            _lastAppliedDuty1 = -1;
             _lastCurvePercent = -1;
+            _manualEngaged = false;
+            _lastSentDuty0 = -1;
+            _lastSentDuty1 = -1;
+            _rampDuty0 = _fan0Duty;
+            _rampDuty1 = _fan1Duty;
+            _lastRampUtc = DateTime.UtcNow;
             _cfg.Save(_cfgPath);
             Invalidate();
             PollAndApplyAsync(true);
@@ -916,13 +985,34 @@ namespace TufFanControl
                         _fan1Rpm = r1;
                     }
 
-                    int maxTemp = Math.Max(_cpuTemp, _gpuTemp);
-
-                    if (_cfg.SafetyOverrideEnabled && _cfg.Mode != FanControlMode.EcAuto)
+                    // Temperature smoothing for control decisions only (cards still show raw values).
+                    if (_smoothCpu < 0) _smoothCpu = _cpuTemp;
+                    if (_smoothGpu < 0) _smoothGpu = _gpuTemp;
+                    if (_cfg.TempSmoothingEnabled && _cfg.RampMode != 2)
                     {
-                        if (maxTemp >= _cfg.SafetyTempLimit)
+                        double a = 0.30;
+                        if (Math.Abs(_cpuTemp - _smoothCpu) > 12) a = 0.16;
+                        if (Math.Abs(_gpuTemp - _smoothGpu) > 12) a = 0.16;
+                        _smoothCpu += a * (_cpuTemp - _smoothCpu);
+                        _smoothGpu += a * (_gpuTemp - _smoothGpu);
+                    }
+                    else
+                    {
+                        _smoothCpu = _cpuTemp;
+                        _smoothGpu = _gpuTemp;
+                    }
+
+                    int rawMax = Math.Max(_cpuTemp, _gpuTemp);
+                    int smoothMax = (int)Math.Round(Math.Max(_smoothCpu, _smoothGpu));
+
+                    // Safety always watches the RAW temperature for the fastest possible reaction.
+                    // HardSafetyTemp is an absolute floor that applies even when the user disables safety.
+                    int limit = _cfg.SafetyOverrideEnabled ? _cfg.SafetyTempLimit : HardSafetyTemp;
+                    if (_cfg.Mode != FanControlMode.EcAuto)
+                    {
+                        if (rawMax >= limit)
                             _safetyTripped = true;
-                        else if (_safetyTripped && maxTemp <= _cfg.SafetyTempLimit - 5)
+                        else if (_safetyTripped && rawMax <= limit - 5)
                         {
                             _safetyTripped = false;
                             forceWrite = true;
@@ -940,50 +1030,48 @@ namespace TufFanControl
                             if (_ec.SendCommand("AUTO", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
                             {
                                 _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
+                                _rampDuty0 = d0;
+                                _rampDuty1 = d1;
                             }
-                            _lastAppliedDuty0 = -1;
-                            _lastAppliedDuty1 = -1;
+                            _manualEngaged = false;
+                            _lastSentDuty0 = -1;
+                            _lastSentDuty1 = -1;
                         }
                     }
-                    else if (_cfg.Mode == FanControlMode.FansOff)
+                    else
                     {
-                        if (forceWrite || _hwEcMode != 1 || _lastAppliedDuty0 != 0 || _lastAppliedDuty1 != 0 || _fan0Duty != 0 || _fan1Duty != 0)
+                        // Compute the target duty for this mode, then let RampTick glide to it.
+                        if (_cfg.Mode == FanControlMode.FansOff)
                         {
-                            if (_ec.SendCommand("MANUAL 0 0", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
-                            {
-                                _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
-                                _lastAppliedDuty0 = 0;
-                                _lastAppliedDuty1 = 0;
-                            }
+                            _targetDuty0 = 0;
+                            _targetDuty1 = 0;
                         }
-                    }
-                    else if (_cfg.Mode == FanControlMode.Manual)
-                    {
-                        int target0 = (int)Math.Round(_cfg.ManualCpuPercent * 255.0 / 100.0);
-                        int target1 = (int)Math.Round((_cfg.LinkFans ? _cfg.ManualCpuPercent : _cfg.ManualGpuPercent) * 255.0 / 100.0);
-                        if (forceWrite || _hwEcMode != 1 || Math.Abs(_lastAppliedDuty0 - target0) > 1 || Math.Abs(_lastAppliedDuty1 - target1) > 1)
+                        else if (_cfg.Mode == FanControlMode.Manual)
                         {
-                            string cmd = string.Format(CultureInfo.InvariantCulture, "MANUAL {0} {1}", target0, target1);
+                            _targetDuty0 = (int)Math.Round(_cfg.ManualCpuPercent * 255.0 / 100.0);
+                            _targetDuty1 = (int)Math.Round((_cfg.LinkFans ? _cfg.ManualCpuPercent : _cfg.ManualGpuPercent) * 255.0 / 100.0);
+                        }
+                        else
+                        {
+                            int pct = EvaluateCurvePercent(smoothMax);
+                            int td = (int)Math.Round(pct * 255.0 / 100.0);
+                            _targetDuty0 = td;
+                            _targetDuty1 = td;
+                        }
+
+                        // Engage manual mode once, seeded with the CURRENT duty so nothing jumps.
+                        if (!_manualEngaged || _hwEcMode != 1)
+                        {
+                            _rampDuty0 = _fan0Duty;
+                            _rampDuty1 = _fan1Duty;
+                            string cmd = string.Format(CultureInfo.InvariantCulture, "MANUAL {0} {1}", _rampDuty0, _rampDuty1);
                             if (_ec.SendCommand(cmd, out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
                             {
                                 _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
-                                _lastAppliedDuty0 = target0;
-                                _lastAppliedDuty1 = target1;
-                            }
-                        }
-                    }
-                    else if (_cfg.Mode == FanControlMode.CustomCurve)
-                    {
-                        int pct = EvaluateCurvePercent(maxTemp);
-                        int targetDuty = (int)Math.Round(pct * 255.0 / 100.0);
-                        if (forceWrite || _hwEcMode != 1 || Math.Abs(_lastAppliedDuty0 - targetDuty) > 2 || Math.Abs(_lastAppliedDuty1 - targetDuty) > 2)
-                        {
-                            string cmd = string.Format(CultureInfo.InvariantCulture, "MANUAL {0} {1}", targetDuty, targetDuty);
-                            if (_ec.SendCommand(cmd, out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
-                            {
-                                _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
-                                _lastAppliedDuty0 = targetDuty;
-                                _lastAppliedDuty1 = targetDuty;
+                                _lastSentDuty0 = _rampDuty0;
+                                _lastSentDuty1 = _rampDuty1;
+                                _manualEngaged = true;
+                                _lastRampUtc = DateTime.UtcNow;
                             }
                         }
                     }
@@ -1004,6 +1092,81 @@ namespace TufFanControl
                     _workerBusy = false;
                 }
             });
+        }
+
+        private void RampTick()
+        {
+            if (_workerBusy) return;
+            if (!_ec.Connected) return;
+            if (_safetyTripped) return;
+            if (_cfg.Mode == FanControlMode.EcAuto) return;
+            if (!_manualEngaged) return;
+
+            DateTime now = DateTime.UtcNow;
+            double dt = (now - _lastRampUtc).TotalSeconds;
+            _lastRampUtc = now;
+            if (dt <= 0.0) return;
+            if (dt > 1.0) dt = 1.0;
+
+            int old0 = _rampDuty0;
+            int old1 = _rampDuty1;
+
+            if (_cfg.RampMode == 2)
+            {
+                _rampDuty0 = _targetDuty0;
+                _rampDuty1 = _targetDuty1;
+            }
+            else
+            {
+                double upSec = (_cfg.RampMode == 0) ? 2.5 : 1.0;
+                double downSec = (_cfg.RampMode == 0) ? 5.0 : 2.0;
+
+                double maxUp = 255.0 * dt / upSec;
+                double maxDown = 255.0 * dt / downSec;
+
+                _rampDuty0 = StepToward(_rampDuty0, _targetDuty0, maxUp, maxDown);
+                _rampDuty1 = StepToward(_rampDuty1, _targetDuty1, maxUp, maxDown);
+            }
+
+            if (_rampDuty0 == old0 && _rampDuty1 == old1) return;
+            if (_rampDuty0 == _lastSentDuty0 && _rampDuty1 == _lastSentDuty1) return;
+
+            int send0 = _rampDuty0;
+            int send1 = _rampDuty1;
+            _workerBusy = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    if (_ec.SendDuty(send0, send1))
+                    {
+                        _lastSentDuty0 = send0;
+                        _lastSentDuty1 = send1;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _workerBusy = false;
+                }
+            });
+        }
+
+        private static int StepToward(int current, int target, double maxUp, double maxDown)
+        {
+            if (current == target) return target;
+            if (target > current)
+            {
+                int step = (int)Math.Floor(maxUp);
+                if (step < 1) step = 1;
+                return Math.Min(target, current + step);
+            }
+            else
+            {
+                int step = (int)Math.Floor(maxDown);
+                if (step < 1) step = 1;
+                return Math.Max(target, current - step);
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1124,14 +1287,26 @@ namespace TufFanControl
             FillRoundedRect(g, footCard, 10, t.BgCard);
             DrawRoundedRect(g, footCard, 10, _safetyTripped ? t.AccentAmber : t.BorderCard, _safetyTripped ? 1.5f : 1f);
 
-            _safetyToggleRect = new Rectangle(pad + 14, footY + 13, 145, 22);
+            _safetyToggleRect = new Rectangle(pad + 14, footY + 13, 140, 22);
             DrawToggleSwitch(g, _safetyToggleRect, _cfg.SafetyOverrideEnabled, "Safety Cut-In", t.AccentAmber, t);
 
-            _safetySliderRect = new Rectangle(pad + 170, footY + 13, 125, 22);
-            DrawCompactSlider(g, _safetySliderRect, _cfg.SafetyTempLimit, 70, 95, "°C", t.AccentAmber, _cfg.SafetyOverrideEnabled, t);
+            _safetySliderRect = new Rectangle(pad + 160, footY + 13, 122, 22);
+            DrawCompactSlider(g, _safetySliderRect, _cfg.SafetyTempLimit, 70, 90, "°C", t.AccentAmber, _cfg.SafetyOverrideEnabled, t);
 
-            _restoreOnExitRect = new Rectangle(pad + w - 118, footY + 14, 106, 22);
-            DrawCheckBox(g, _restoreOnExitRect, _cfg.RestoreAutoOnExit, "Auto on Exit", t.AccentGreen, t);
+            _rampPillRect = new Rectangle(pad + 290, footY + 11, 88, 26);
+            bool rampHover = _rampPillRect.Contains(_mousePos);
+            string rampText = (_cfg.RampMode == 0) ? "Ramp: Smooth" : (_cfg.RampMode == 1 ? "Ramp: Fast" : "Ramp: Instant");
+            FillRoundedRect(g, _rampPillRect, 6, rampHover ? t.BgHover : t.BgSubtle);
+            DrawRoundedRect(g, _rampPillRect, 6, rampHover ? t.TextMuted : t.BorderCard, 1f);
+            using (Font fr = new Font("Segoe UI", 7.8f, FontStyle.Regular))
+            using (SolidBrush br = new SolidBrush(t.TextSecondary))
+            {
+                StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+                g.DrawString(rampText, fr, br, _rampPillRect, sf);
+            }
+
+            _restoreOnExitRect = new Rectangle(pad + 384, footY + 14, 84, 22);
+            DrawCheckBoxCompact(g, _restoreOnExitRect, _cfg.RestoreAutoOnExit, "Auto-Exit", t.AccentGreen, t);
         }
 
         private void DrawSmallHeaderButton(Graphics g, Rectangle r, string text, bool isLightIcon, bool showThemeDot, ThemePalette t)
@@ -1492,6 +1667,30 @@ namespace TufFanControl
             }
         }
 
+        private void DrawCheckBoxCompact(Graphics g, Rectangle r, bool checkedState, string text, Color accent, ThemePalette t)
+        {
+            Rectangle box = new Rectangle(r.X, r.Y + 3, 15, 15);
+            FillRoundedRect(g, box, 4, checkedState ? accent : t.BgSubtle);
+            DrawRoundedRect(g, box, 4, checkedState ? accent : t.BorderCard, 1.2f);
+            if (checkedState)
+            {
+                using (Pen p = new Pen(Color.White, 1.8f))
+                {
+                    g.DrawLines(p, new Point[]
+                    {
+                        new Point(box.X + 3, box.Y + 7),
+                        new Point(box.X + 6, box.Y + 11),
+                        new Point(box.X + 12, box.Y + 4)
+                    });
+                }
+            }
+            using (Font f = new Font("Segoe UI", 7.8f, FontStyle.Regular))
+            using (SolidBrush b = new SolidBrush(t.TextSecondary))
+            {
+                g.DrawString(text, f, b, box.Right + 5, r.Y + 3);
+            }
+        }
+
         private void DrawToggleSwitch(Graphics g, Rectangle r, bool on, string text, Color accent, ThemePalette t)
         {
             Rectangle sw = new Rectangle(r.X, r.Y + 2, 34, 18);
@@ -1662,6 +1861,19 @@ namespace TufFanControl
                 return;
             }
 
+            if (_rampPillRect.Contains(e.Location))
+            {
+                _cfg.RampMode = (_cfg.RampMode + 1) % 3;
+                if (_cfg.RampMode == 2)
+                {
+                    _rampDuty0 = _targetDuty0;
+                    _rampDuty1 = _targetDuty1;
+                }
+                _cfg.Save(_cfgPath);
+                Invalidate();
+                return;
+            }
+
             if (_restoreOnExitRect.Contains(e.Location))
             {
                 _cfg.RestoreAutoOnExit = !_cfg.RestoreAutoOnExit;
@@ -1695,7 +1907,7 @@ namespace TufFanControl
             {
                 int trackW = Math.Max(1, _safetySliderRect.Width - 42);
                 double ratio = (double)(mouseX - _safetySliderRect.Left) / (double)trackW;
-                int limit = 70 + (int)Math.Round(Math.Max(0.0, Math.Min(1.0, ratio)) * 25.0);
+                int limit = 70 + (int)Math.Round(Math.Max(0.0, Math.Min(1.0, ratio)) * 20.0);
                 _cfg.SafetyTempLimit = limit;
                 Invalidate();
             }
