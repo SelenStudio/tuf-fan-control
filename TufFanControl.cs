@@ -9,10 +9,12 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace TufFanControl
 {
@@ -260,6 +262,18 @@ namespace TufFanControl
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("winmm.dll")]
+        public static extern uint timeBeginPeriod(uint uPeriod);
+
+        [DllImport("winmm.dll")]
+        public static extern uint timeEndPeriod(uint uPeriod);
+
         [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
@@ -332,9 +346,75 @@ namespace TufFanControl
 
     internal static class SystemEcWorker
     {
+        private const int WorkerHardSafetyTemp = 92;
         private static IntPtr _hDevice = IntPtr.Zero;
         private static readonly object _ecLock = new object();
+        private static Mutex _hwMutex;
         private static bool _keepOnExit = false;
+
+        private static void InitHwMutex()
+        {
+            if (_hwMutex != null) return;
+            try
+            {
+                MutexSecurity sec = new MutexSecurity();
+                sec.AddAccessRule(new MutexAccessRule(
+                    new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                    MutexRights.FullControl, AccessControlType.Allow));
+                bool createdNew;
+                _hwMutex = new Mutex(false, @"Global\TufFanControl_EcHw_Mutex", out createdNew, sec);
+            }
+            catch
+            {
+                try { _hwMutex = new Mutex(false, @"Global\TufFanControl_EcHw_Mutex"); } catch { }
+            }
+        }
+
+        private static bool AcquireHwMutex()
+        {
+            InitHwMutex();
+            if (_hwMutex == null) return false;
+            try
+            {
+                return _hwMutex.WaitOne(2500);
+            }
+            catch (AbandonedMutexException)
+            {
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void ReleaseHwMutex(bool acquired)
+        {
+            if (!acquired || _hwMutex == null) return;
+            try { _hwMutex.ReleaseMutex(); } catch { }
+        }
+
+        private static void CloseDeviceInternal()
+        {
+            if (_hDevice != IntPtr.Zero && _hDevice != new IntPtr(-1))
+            {
+                try { NativeMethods.CloseHandle(_hDevice); } catch { }
+            }
+            _hDevice = IntPtr.Zero;
+        }
+
+        private static void EnsureDriverService()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("sc.exe", "start AsusSAIO");
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                Process p = Process.Start(psi);
+                if (p != null) p.WaitForExit(1200);
+            }
+            catch { }
+        }
 
         private static bool OpenDevice()
         {
@@ -342,6 +422,13 @@ namespace TufFanControl
                 return true;
             _hDevice = NativeMethods.CreateFileW(
                 @"\\.\AsusSAIO", 0xC0000000u, 3u, IntPtr.Zero, 3u, 0x80u, IntPtr.Zero);
+            if (_hDevice == IntPtr.Zero || _hDevice == new IntPtr(-1))
+            {
+                _hDevice = IntPtr.Zero;
+                EnsureDriverService();
+                _hDevice = NativeMethods.CreateFileW(
+                    @"\\.\AsusSAIO", 0xC0000000u, 3u, IntPtr.Zero, 3u, 0x80u, IntPtr.Zero);
+            }
             return (_hDevice != IntPtr.Zero && _hDevice != new IntPtr(-1));
         }
 
@@ -350,31 +437,36 @@ namespace TufFanControl
             resultByte = 0;
             lock (_ecLock)
             {
-                if (!OpenDevice()) return false;
-                byte[] buf = new byte[16];
-                buf[0] = cmd;
-                buf[1] = (byte)payload.Length;
-                for (int i = 0; i < payload.Length && i < 8; i++)
-                    buf[2 + i] = payload[i];
-                buf[10] = readDir;
-                uint retBytes = 0;
-                bool ok = NativeMethods.DeviceIoControl(
-                    _hDevice, 0x80102070u, buf, 16u, buf, 16u, out retBytes, IntPtr.Zero);
-                int status = BitConverter.ToInt32(buf, 12);
-                resultByte = buf[11];
-                if (readDir == 0)
-                    Thread.Sleep(22);
-                else
-                    Thread.Sleep(6);
-                return ok && (status == 0);
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    if (!OpenDevice()) return false;
+                    byte[] buf = new byte[16];
+                    buf[0] = cmd;
+                    buf[1] = (byte)payload.Length;
+                    for (int i = 0; i < payload.Length && i < 8; i++)
+                        buf[2 + i] = payload[i];
+                    buf[10] = readDir;
+                    uint retBytes = 0;
+                    bool ok = NativeMethods.DeviceIoControl(
+                        _hDevice, 0x80102070u, buf, 16u, buf, 16u, out retBytes, IntPtr.Zero);
+                    int status = BitConverter.ToInt32(buf, 12);
+                    resultByte = buf[11];
+                    if (readDir == 0)
+                        Thread.Sleep(16);
+                    else
+                        Thread.Sleep(5);
+                    if (ok && status == 0)
+                        return true;
+                    CloseDeviceInternal();
+                    Thread.Sleep(10);
+                }
+                return false;
             }
         }
 
-        private static byte ReadReg(byte reg)
+        private static bool ReadReg(byte reg, out byte val)
         {
-            byte val;
-            EcTransaction(0xDD, new byte[] { 0x02, reg, 0x00 }, 1, out val);
-            return val;
+            return EcTransaction(0xDD, new byte[] { 0x02, reg, 0x00 }, 1, out val);
         }
 
         private static bool WriteReg(byte reg, byte val)
@@ -385,56 +477,96 @@ namespace TufFanControl
 
         private static void SetAutoMode()
         {
-            WriteReg(0x31, 0x00);
+            bool hasMut = AcquireHwMutex();
+            try
+            {
+                WriteReg(0x31, 0x00);
+            }
+            finally
+            {
+                ReleaseHwMutex(hasMut);
+            }
         }
 
         private static void SetManualDuties(byte duty0, byte duty1)
         {
-            byte[] duties = new byte[] { duty0, duty1 };
-            for (byte fan = 0; fan < 2; fan++)
+            bool hasMut = AcquireHwMutex();
+            try
             {
-                WriteReg(0x32, fan);
-                WriteReg(0x31, 0x01);
-                WriteReg(0x32, fan);
-                WriteReg(0x35, duties[fan]);
+                byte[] duties = new byte[] { duty0, duty1 };
+                for (byte fan = 0; fan < 2; fan++)
+                {
+                    WriteReg(0x32, fan);
+                    WriteReg(0x31, 0x01);
+                    WriteReg(0x35, duties[fan]);
+                }
+            }
+            finally
+            {
+                ReleaseHwMutex(hasMut);
             }
         }
 
         // Fast path for ramp steps: assumes manual mode already engaged.
-        private static void WriteDutiesOnly(byte duty0, byte duty1)
+        private static bool WriteDutiesOnly(byte duty0, byte duty1)
         {
-            WriteReg(0x32, 0);
-            WriteReg(0x35, duty0);
-            WriteReg(0x32, 1);
-            WriteReg(0x35, duty1);
+            bool hasMut = AcquireHwMutex();
+            try
+            {
+                bool ok0 = WriteReg(0x32, 0) && WriteReg(0x35, duty0);
+                bool ok1 = WriteReg(0x32, 1) && WriteReg(0x35, duty1);
+                return ok0 && ok1;
+            }
+            finally
+            {
+                ReleaseHwMutex(hasMut);
+            }
         }
 
         private static string ReadTelemetryLine()
         {
-            if (!OpenDevice())
-                return "ERR NoDevice";
-            byte mode = ReadReg(0x31);
-            byte cpuTemp = ReadReg(0x00);
-            byte gpuTemp = ReadReg(0x03);
-
-            int[] duties = new int[2];
-            int[] rpms = new int[2];
-            for (byte fan = 0; fan < 2; fan++)
+            bool hasMut = AcquireHwMutex();
+            try
             {
-                WriteReg(0x32, fan);
-                byte duty = ReadReg(0x35);
-                byte hi = ReadReg(0x34);
-                byte lo = ReadReg(0x33);
-                duties[fan] = duty;
-                rpms[fan] = ((int)hi << 8) | (int)lo;
+                if (!OpenDevice())
+                    return "ERR NoDevice";
+                byte mode, cpuTemp, gpuTemp;
+                if (!ReadReg(0x31, out mode) || !ReadReg(0x00, out cpuTemp) || !ReadReg(0x03, out gpuTemp))
+                    return "ERR IoFail";
+
+                // Hardware-level backstop: never allow EC manual mode to stay engaged at or above 92C.
+                if (mode != 0 && (cpuTemp >= WorkerHardSafetyTemp || gpuTemp >= WorkerHardSafetyTemp))
+                {
+                    WriteReg(0x31, 0x00);
+                    mode = 0;
+                }
+
+                int[] duties = new int[2];
+                int[] rpms = new int[2];
+                for (byte fan = 0; fan < 2; fan++)
+                {
+                    if (!WriteReg(0x32, fan)) return "ERR IoFail";
+                    byte duty, hi, lo;
+                    if (!ReadReg(0x35, out duty) || !ReadReg(0x34, out hi) || !ReadReg(0x33, out lo))
+                        return "ERR IoFail";
+                    duties[fan] = duty;
+                    rpms[fan] = ((int)hi << 8) | (int)lo;
+                }
+                return string.Format(CultureInfo.InvariantCulture,
+                    "OK {0} {1} {2} {3} {4} {5} {6}",
+                    mode, cpuTemp, gpuTemp, duties[0], rpms[0], duties[1], rpms[1]);
             }
-            return string.Format(CultureInfo.InvariantCulture,
-                "OK {0} {1} {2} {3} {4} {5} {6}",
-                mode, cpuTemp, gpuTemp, duties[0], rpms[0], duties[1], rpms[1]);
+            finally
+            {
+                ReleaseHwMutex(hasMut);
+            }
         }
 
         public static void Run(int port, int parentPid, string token)
         {
+            try { NativeMethods.timeBeginPeriod(1); } catch { }
+            try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
+
             Thread parentWatcher = new Thread(delegate()
             {
                 try
@@ -447,10 +579,8 @@ namespace TufFanControl
                 {
                     try { SetAutoMode(); } catch { }
                 }
-                if (_hDevice != IntPtr.Zero && _hDevice != new IntPtr(-1))
-                {
-                    NativeMethods.CloseHandle(_hDevice);
-                }
+                CloseDeviceInternal();
+                try { NativeMethods.timeEndPeriod(1); } catch { }
                 Environment.Exit(0);
             });
             parentWatcher.IsBackground = true;
@@ -459,55 +589,64 @@ namespace TufFanControl
             try
             {
                 using (TcpClient client = new TcpClient("127.0.0.1", port))
-                using (NetworkStream ns = client.GetStream())
-                using (StreamReader sr = new StreamReader(ns, Encoding.UTF8))
-                using (StreamWriter sw = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true })
                 {
-                    sw.WriteLine("HELLO " + token);
-                    string line;
-                    while ((line = sr.ReadLine()) != null)
+                    client.NoDelay = true;
+                    using (NetworkStream ns = client.GetStream())
                     {
-                        string[] parts = line.Trim().Split(' ');
-                        string cmd = parts[0];
-                        if (cmd == "POLL")
+                        // Dead-man timeout: if UI hangs/stops polling for 12s, exit and restore EC Auto.
+                        ns.ReadTimeout = 12000;
+                        ns.WriteTimeout = 8000;
+                        using (StreamReader sr = new StreamReader(ns, Encoding.UTF8))
+                        using (StreamWriter sw = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true })
                         {
-                            sw.WriteLine(ReadTelemetryLine());
-                        }
-                        else if (cmd == "AUTO")
-                        {
-                            SetAutoMode();
-                            sw.WriteLine(ReadTelemetryLine());
-                        }
-                        else if (cmd == "MANUAL" && parts.Length >= 3)
-                        {
-                            int d0, d1;
-                            if (int.TryParse(parts[1], out d0) && int.TryParse(parts[2], out d1))
+                            sw.WriteLine("HELLO " + token);
+                            string line;
+                            while ((line = sr.ReadLine()) != null)
                             {
-                                SetManualDuties((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
+                                string[] parts = line.Trim().Split(' ');
+                                string cmd = parts[0];
+                                if (cmd == "POLL")
+                                {
+                                    sw.WriteLine(ReadTelemetryLine());
+                                }
+                                else if (cmd == "AUTO")
+                                {
+                                    SetAutoMode();
+                                    sw.WriteLine(ReadTelemetryLine());
+                                }
+                                else if (cmd == "MANUAL" && parts.Length >= 3)
+                                {
+                                    int d0, d1;
+                                    if (int.TryParse(parts[1], out d0) && int.TryParse(parts[2], out d1))
+                                    {
+                                        SetManualDuties((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
+                                    }
+                                    sw.WriteLine(ReadTelemetryLine());
+                                }
+                                else if (cmd == "DUTY" && parts.Length >= 3)
+                                {
+                                    int d0, d1;
+                                    bool ok = false;
+                                    if (int.TryParse(parts[1], out d0) && int.TryParse(parts[2], out d1))
+                                    {
+                                        ok = WriteDutiesOnly((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
+                                    }
+                                    sw.WriteLine(ok ? "OKD" : "ERR DutyFail");
+                                }
+                                else if (cmd == "KEEP_ON_EXIT" && parts.Length >= 2)
+                                {
+                                    _keepOnExit = (parts[1] == "1");
+                                    sw.WriteLine("OK_KEEP");
+                                }
+                                else if (cmd == "SHUTDOWN")
+                                {
+                                    bool restore = (parts.Length < 2 || parts[1] == "1");
+                                    _keepOnExit = !restore;
+                                    if (restore) SetAutoMode();
+                                    sw.WriteLine("BYE");
+                                    break;
+                                }
                             }
-                            sw.WriteLine(ReadTelemetryLine());
-                        }
-                        else if (cmd == "DUTY" && parts.Length >= 3)
-                        {
-                            int d0, d1;
-                            if (int.TryParse(parts[1], out d0) && int.TryParse(parts[2], out d1))
-                            {
-                                WriteDutiesOnly((byte)Math.Max(0, Math.Min(255, d0)), (byte)Math.Max(0, Math.Min(255, d1)));
-                            }
-                            sw.WriteLine("OKD");
-                        }
-                        else if (cmd == "KEEP_ON_EXIT" && parts.Length >= 2)
-                        {
-                            _keepOnExit = (parts[1] == "1");
-                            sw.WriteLine("OK_KEEP");
-                        }
-                        else if (cmd == "SHUTDOWN")
-                        {
-                            bool restore = (parts.Length < 2 || parts[1] == "1");
-                            _keepOnExit = !restore;
-                            if (restore) SetAutoMode();
-                            sw.WriteLine("BYE");
-                            break;
                         }
                     }
                 }
@@ -519,10 +658,8 @@ namespace TufFanControl
                 {
                     try { SetAutoMode(); } catch { }
                 }
-                if (_hDevice != IntPtr.Zero && _hDevice != new IntPtr(-1))
-                {
-                    NativeMethods.CloseHandle(_hDevice);
-                }
+                CloseDeviceInternal();
+                try { NativeMethods.timeEndPeriod(1); } catch { }
             }
         }
     }
@@ -533,11 +670,41 @@ namespace TufFanControl
         private TcpClient _client;
         private StreamReader _reader;
         private StreamWriter _writer;
+        private int _workerPid = 0;
+        private bool _keepOnExit = false;
+        private bool _disposed = false;
+        private DateTime _lastConnectAttemptUtc = DateTime.MinValue;
         private readonly object _ioLock = new object();
+
         public bool Connected { get; private set; }
+        public int ConnectionGeneration { get; private set; }
 
         public bool Start()
         {
+            lock (_ioLock)
+            {
+                return ConnectInternal();
+            }
+        }
+
+        public bool EnsureConnected()
+        {
+            lock (_ioLock)
+            {
+                if (Connected) return true;
+                if (_disposed) return false;
+                DateTime now = DateTime.UtcNow;
+                if ((now - _lastConnectAttemptUtc).TotalMilliseconds < 1200)
+                    return false;
+                return ConnectInternal();
+            }
+        }
+
+        private bool ConnectInternal()
+        {
+            if (_disposed) return false;
+            _lastConnectAttemptUtc = DateTime.UtcNow;
+            CleanupConnectionInternal(true);
             try
             {
                 EnsureAsusSaioDriverRunning();
@@ -547,31 +714,79 @@ namespace TufFanControl
                 string token = Guid.NewGuid().ToString("N");
                 int myPid = Process.GetCurrentProcess().Id;
 
-                if (!SpawnSystemWorker(port, myPid, token))
+                int spawnedPid;
+                if (!SpawnSystemWorker(port, myPid, token, out spawnedPid))
+                {
+                    CleanupConnectionInternal(true);
                     return false;
+                }
+                _workerPid = spawnedPid;
 
                 IAsyncResult ar = _listener.BeginAcceptTcpClient(null, null);
-                if (!ar.AsyncWaitHandle.WaitOne(5000))
+                if (!ar.AsyncWaitHandle.WaitOne(6000))
+                {
+                    CleanupConnectionInternal(true);
                     return false;
+                }
 
                 _client = _listener.EndAcceptTcpClient(ar);
+                try { _listener.Stop(); } catch { }
+                _listener = null;
+
                 _client.NoDelay = true;
                 NetworkStream ns = _client.GetStream();
-                ns.ReadTimeout = 4000;
-                ns.WriteTimeout = 4000;
+                ns.ReadTimeout = 8000;
+                ns.WriteTimeout = 8000;
                 _reader = new StreamReader(ns, Encoding.UTF8);
                 _writer = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true };
 
                 string hello = _reader.ReadLine();
                 if (hello != "HELLO " + token)
+                {
+                    CleanupConnectionInternal(true);
                     return false;
+                }
+
+                _writer.WriteLine("KEEP_ON_EXIT " + (_keepOnExit ? "1" : "0"));
+                string keepResp = _reader.ReadLine();
+                if (keepResp != "OK_KEEP")
+                {
+                    CleanupConnectionInternal(true);
+                    return false;
+                }
 
                 Connected = true;
+                ConnectionGeneration++;
                 return true;
             }
             catch
             {
+                CleanupConnectionInternal(true);
                 return false;
+            }
+        }
+
+        private void CleanupConnectionInternal(bool killWorker)
+        {
+            Connected = false;
+            try { if (_writer != null) _writer.Dispose(); } catch { }
+            try { if (_reader != null) _reader.Dispose(); } catch { }
+            try { if (_client != null) _client.Close(); } catch { }
+            try { if (_listener != null) _listener.Stop(); } catch { }
+            _writer = null;
+            _reader = null;
+            _client = null;
+            _listener = null;
+
+            if (killWorker && _workerPid > 0)
+            {
+                try
+                {
+                    Process wp = Process.GetProcessById(_workerPid);
+                    if (!wp.HasExited) wp.Kill();
+                }
+                catch { }
+                _workerPid = 0;
             }
         }
 
@@ -588,8 +803,9 @@ namespace TufFanControl
             catch { }
         }
 
-        private static bool SpawnSystemWorker(int port, int parentPid, string token)
+        private static bool SpawnSystemWorker(int port, int parentPid, string token, out int workerPid)
         {
+            workerPid = 0;
             Process[] procs = Process.GetProcessesByName("winlogon");
             if (procs == null || procs.Length == 0) return false;
             uint winlogonPid = (uint)procs[0].Id;
@@ -625,6 +841,7 @@ namespace TufFanControl
 
             if (ok)
             {
+                workerPid = pi.dwProcessId;
                 NativeMethods.CloseHandle(pi.hProcess);
                 NativeMethods.CloseHandle(pi.hThread);
             }
@@ -637,86 +854,107 @@ namespace TufFanControl
         public bool SendCommand(string cmd, out int ecMode, out int cpuTemp, out int gpuTemp, out int d0, out int rpm0, out int d1, out int rpm1)
         {
             ecMode = 0; cpuTemp = 0; gpuTemp = 0; d0 = 0; rpm0 = 0; d1 = 0; rpm1 = 0;
-            if (!Connected) return false;
             lock (_ioLock)
             {
-                try
+                if (_disposed) return false;
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    _writer.WriteLine(cmd);
-                    string resp = _reader.ReadLine();
-                    if (string.IsNullOrEmpty(resp) || !resp.StartsWith("OK "))
+                    if (!Connected && !ConnectInternal())
                         return false;
-                    string[] p = resp.Split(' ');
-                    if (p.Length < 8) return false;
-                    int.TryParse(p[1], out ecMode);
-                    int.TryParse(p[2], out cpuTemp);
-                    int.TryParse(p[3], out gpuTemp);
-                    int.TryParse(p[4], out d0);
-                    int.TryParse(p[5], out rpm0);
-                    int.TryParse(p[6], out d1);
-                    int.TryParse(p[7], out rpm1);
-                    return true;
+                    try
+                    {
+                        _writer.WriteLine(cmd);
+                        string resp = _reader.ReadLine();
+                        if (!string.IsNullOrEmpty(resp) && resp.StartsWith("OK "))
+                        {
+                            string[] p = resp.Split(' ');
+                            if (p.Length >= 8)
+                            {
+                                int.TryParse(p[1], out ecMode);
+                                int.TryParse(p[2], out cpuTemp);
+                                int.TryParse(p[3], out gpuTemp);
+                                int.TryParse(p[4], out d0);
+                                int.TryParse(p[5], out rpm0);
+                                int.TryParse(p[6], out d1);
+                                int.TryParse(p[7], out rpm1);
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                    CleanupConnectionInternal(true);
                 }
-                catch
-                {
-                    Connected = false;
-                    return false;
-                }
+                return false;
             }
         }
 
         public bool SendDuty(int d0, int d1)
         {
-            if (!Connected) return false;
             lock (_ioLock)
             {
-                try
+                if (_disposed) return false;
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    _writer.WriteLine("DUTY " + d0 + " " + d1);
-                    string resp = _reader.ReadLine();
-                    return resp == "OKD";
+                    if (!Connected && !ConnectInternal())
+                        return false;
+                    try
+                    {
+                        _writer.WriteLine("DUTY " + d0 + " " + d1);
+                        string resp = _reader.ReadLine();
+                        if (resp == "OKD")
+                            return true;
+                    }
+                    catch { }
+                    CleanupConnectionInternal(true);
                 }
-                catch
-                {
-                    Connected = false;
-                    return false;
-                }
+                return false;
             }
         }
 
         public void SetKeepOnExit(bool keep)
         {
-            if (!Connected) return;
             lock (_ioLock)
             {
+                _keepOnExit = keep;
+                if (!Connected) return;
                 try
                 {
                     _writer.WriteLine("KEEP_ON_EXIT " + (keep ? "1" : "0"));
-                    _reader.ReadLine();
+                    string resp = _reader.ReadLine();
+                    if (resp != "OK_KEEP")
+                        CleanupConnectionInternal(true);
                 }
-                catch { }
+                catch
+                {
+                    CleanupConnectionInternal(true);
+                }
             }
         }
 
         public void Shutdown(bool restoreAuto)
         {
-            if (!Connected) return;
             lock (_ioLock)
             {
+                _disposed = true;
+                _keepOnExit = !restoreAuto;
+                if (!Connected) return;
                 try
                 {
                     _writer.WriteLine("SHUTDOWN " + (restoreAuto ? "1" : "0"));
                     _reader.ReadLine();
                 }
                 catch { }
-                Connected = false;
+                CleanupConnectionInternal(false);
             }
         }
 
         public void Dispose()
         {
-            try { if (_client != null) _client.Close(); } catch { }
-            try { if (_listener != null) _listener.Stop(); } catch { }
+            lock (_ioLock)
+            {
+                _disposed = true;
+                CleanupConnectionInternal(false);
+            }
         }
     }
 
@@ -728,9 +966,16 @@ namespace TufFanControl
         private readonly AppConfig _cfg;
         private readonly string _cfgPath;
         private readonly EcBridge _ec;
-        private readonly System.Windows.Forms.Timer _pollTimer;
         private readonly NotifyIcon _trayIcon;
         private readonly ContextMenuStrip _trayMenu;
+        private readonly EventWaitHandle _activateEvent;
+        private readonly AutoResetEvent _wakeEvent = new AutoResetEvent(false);
+        private Thread _controlThread;
+        private Thread _activateThread;
+        private volatile bool _closing = false;
+        private volatile bool _forceApplyPending = true;
+        private int _lastSeenGeneration = -1;
+        private DateTime _lastPollUtc = DateTime.MinValue;
 
         // Live telemetry
         private int _hwEcMode = 0;
@@ -743,7 +988,6 @@ namespace TufFanControl
         private bool _safetyTripped = false;
         private int _lastCurveTempAnchor = -100;
         private int _lastCurvePercent = -1;
-        private bool _workerBusy = false;
 
         // Smoothing / ramp state
         private double _smoothCpu = -1;
@@ -756,12 +1000,12 @@ namespace TufFanControl
         private int _lastSentDuty1 = -1;
         private bool _manualEngaged = false;
         private DateTime _lastRampUtc = DateTime.MinValue;
-        private System.Windows.Forms.Timer _rampTimer;
 
         // View state: false = Curve View, true = Manual Sliders View
         private bool _showManualTab = false;
 
         // Hit rectangles
+        private Rectangle _statusPillRect;
         private Rectangle _themeToggleRect;
         private Rectangle _trayBtnRect;
         private Rectangle[] _modeRects = new Rectangle[4];
@@ -793,11 +1037,12 @@ namespace TufFanControl
         private bool _draggingSafetySlider = false;
         private Point _mousePos = Point.Empty;
 
-        public MainForm(AppConfig cfg, string cfgPath, EcBridge ec)
+        public MainForm(AppConfig cfg, string cfgPath, EcBridge ec, EventWaitHandle activateEvent)
         {
             _cfg = cfg;
             _cfgPath = cfgPath;
             _ec = ec;
+            _activateEvent = activateEvent;
             _showManualTab = (_cfg.Mode == FanControlMode.Manual);
 
             Text = "G-Fan Control (FX506LH)";
@@ -836,20 +1081,53 @@ namespace TufFanControl
             _trayIcon.DoubleClick += delegate { ShowFromTray(); };
 
             _ec.SetKeepOnExit(!_cfg.RestoreAutoOnExit);
-
-            _pollTimer = new System.Windows.Forms.Timer();
-            _pollTimer.Interval = 600;
-            _pollTimer.Tick += delegate { PollAndApplyAsync(false); };
-            _pollTimer.Start();
-
-            _rampTimer = new System.Windows.Forms.Timer();
-            _rampTimer.Interval = 200;
-            _rampTimer.Tick += delegate { RampTick(); };
-            _rampTimer.Start();
-
+            _lastSeenGeneration = _ec.ConnectionGeneration;
             _lastRampUtc = DateTime.UtcNow;
 
-            PollAndApplyAsync(true);
+            try { SystemEvents.PowerModeChanged += OnPowerModeChanged; } catch { }
+
+            _controlThread = new Thread(ControlLoop);
+            _controlThread.IsBackground = true;
+            _controlThread.Name = "GFanControlLoop";
+            _controlThread.Start();
+
+            if (_activateEvent != null)
+            {
+                _activateThread = new Thread(ActivateWatcherLoop);
+                _activateThread.IsBackground = true;
+                _activateThread.Name = "GFanActivateWatcher";
+                _activateThread.Start();
+            }
+        }
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Resume)
+            {
+                _manualEngaged = false;
+                _lastSentDuty0 = -1;
+                _lastSentDuty1 = -1;
+                PollAndApplyAsync(true);
+            }
+        }
+
+        private void ActivateWatcherLoop()
+        {
+            while (!_closing)
+            {
+                try
+                {
+                    if (_activateEvent != null && _activateEvent.WaitOne(1000))
+                    {
+                        if (_closing) break;
+                        if (IsHandleCreated)
+                        {
+                            BeginInvoke((MethodInvoker)delegate { ShowFromTray(); });
+                        }
+                    }
+                }
+                catch { Thread.Sleep(500); }
+            }
         }
 
         private void ApplyWindowTheme()
@@ -897,8 +1175,11 @@ namespace TufFanControl
         private void ShowFromTray()
         {
             Show();
+            if (WindowState == FormWindowState.Minimized)
+                NativeMethods.ShowWindow(Handle, 9);
             WindowState = FormWindowState.Normal;
             Activate();
+            NativeMethods.SetForegroundWindow(Handle);
         }
 
         private void SetMode(FanControlMode newMode)
@@ -966,137 +1247,200 @@ namespace TufFanControl
 
         private void PollAndApplyAsync(bool forceWrite)
         {
-            if (_workerBusy && !forceWrite) return;
-            _workerBusy = true;
+            if (forceWrite)
+                _forceApplyPending = true;
+            try { _wakeEvent.Set(); } catch { }
+        }
 
-            ThreadPool.QueueUserWorkItem(delegate
+        private static double SmoothSensor(double smooth, int raw)
+        {
+            if (smooth < 0) return raw;
+            if (raw >= 82 && raw > smooth)
+                return smooth + 0.65 * (raw - smooth);
+            double alpha = (raw >= smooth) ? 0.45 : 0.22;
+            return smooth + alpha * (raw - smooth);
+        }
+
+        private void ControlLoop()
+        {
+            while (!_closing)
             {
                 try
                 {
-                    int ecMode, cTemp, gTemp, d0, r0, d1, r1;
-                    if (_ec.SendCommand("POLL", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
-                    {
-                        _hwEcMode = ecMode;
-                        if (cTemp > 0 && cTemp < 130) _cpuTemp = cTemp;
-                        if (gTemp > 0 && gTemp < 130) _gpuTemp = gTemp;
-                        _fan0Duty = d0;
-                        _fan0Rpm = r0;
-                        _fan1Duty = d1;
-                        _fan1Rpm = r1;
-                    }
+                    DateTime now = DateTime.UtcNow;
+                    bool forceWrite = _forceApplyPending;
+                    _forceApplyPending = false;
 
-                    // Temperature smoothing for control decisions only (cards still show raw values).
-                    if (_smoothCpu < 0) _smoothCpu = _cpuTemp;
-                    if (_smoothGpu < 0) _smoothGpu = _gpuTemp;
-                    if (_cfg.TempSmoothingEnabled && _cfg.RampMode != 2)
+                    if (!_ec.Connected)
                     {
-                        double a = 0.30;
-                        if (Math.Abs(_cpuTemp - _smoothCpu) > 12) a = 0.16;
-                        if (Math.Abs(_gpuTemp - _smoothGpu) > 12) a = 0.16;
-                        _smoothCpu += a * (_cpuTemp - _smoothCpu);
-                        _smoothGpu += a * (_gpuTemp - _smoothGpu);
-                    }
-                    else
-                    {
-                        _smoothCpu = _cpuTemp;
-                        _smoothGpu = _gpuTemp;
-                    }
-
-                    int rawMax = Math.Max(_cpuTemp, _gpuTemp);
-                    int smoothMax = (int)Math.Round(Math.Max(_smoothCpu, _smoothGpu));
-
-                    // Safety always watches the RAW temperature for the fastest possible reaction.
-                    // HardSafetyTemp is an absolute floor that applies even when the user disables safety.
-                    int limit = _cfg.SafetyOverrideEnabled ? _cfg.SafetyTempLimit : HardSafetyTemp;
-                    if (_cfg.Mode != FanControlMode.EcAuto)
-                    {
-                        if (rawMax >= limit)
-                            _safetyTripped = true;
-                        else if (_safetyTripped && rawMax <= limit - 5)
+                        if (_ec.EnsureConnected())
                         {
-                            _safetyTripped = false;
                             forceWrite = true;
                         }
                     }
-                    else
+
+                    if (_ec.ConnectionGeneration != _lastSeenGeneration)
                     {
-                        _safetyTripped = false;
+                        _lastSeenGeneration = _ec.ConnectionGeneration;
+                        _manualEngaged = false;
+                        _lastSentDuty0 = -1;
+                        _lastSentDuty1 = -1;
+                        forceWrite = true;
                     }
 
-                    if (_safetyTripped || _cfg.Mode == FanControlMode.EcAuto)
+                    bool dueForPoll = forceWrite || ((now - _lastPollUtc).TotalMilliseconds >= 580);
+                    if (dueForPoll && _ec.Connected)
                     {
-                        if (_hwEcMode != 0 || forceWrite)
+                        _lastPollUtc = now;
+                        PollAndUpdateTargets(forceWrite);
+                    }
+
+                    if (_ec.Connected)
+                    {
+                        StepRampOnControlThread();
+                    }
+
+                    if (dueForPoll && !_closing && IsHandleCreated)
+                    {
+                        try
                         {
-                            if (_ec.SendCommand("AUTO", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
+                            BeginInvoke((MethodInvoker)delegate
                             {
-                                _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
-                                _rampDuty0 = d0;
-                                _rampDuty1 = d1;
-                            }
-                            _manualEngaged = false;
-                            _lastSentDuty0 = -1;
-                            _lastSentDuty1 = -1;
+                                if (_closing) return;
+                                string modeLabel = !_ec.Connected ? "RECONNECTING" : (_safetyTripped ? "SAFETY" : _cfg.Mode.ToString());
+                                string tip = string.Format("CPU {0}°C ({1} RPM) | GPU {2}°C ({3} RPM) [{4}]",
+                                    _cpuTemp, _fan0Rpm, _gpuTemp, _fan1Rpm, modeLabel);
+                                if (tip.Length > 63) tip = tip.Substring(0, 63);
+                                _trayIcon.Text = tip;
+                                Invalidate();
+                            });
                         }
+                        catch { }
                     }
-                    else
-                    {
-                        // Compute the target duty for this mode, then let RampTick glide to it.
-                        if (_cfg.Mode == FanControlMode.FansOff)
-                        {
-                            _targetDuty0 = 0;
-                            _targetDuty1 = 0;
-                        }
-                        else if (_cfg.Mode == FanControlMode.Manual)
-                        {
-                            _targetDuty0 = (int)Math.Round(_cfg.ManualCpuPercent * 255.0 / 100.0);
-                            _targetDuty1 = (int)Math.Round((_cfg.LinkFans ? _cfg.ManualCpuPercent : _cfg.ManualGpuPercent) * 255.0 / 100.0);
-                        }
-                        else
-                        {
-                            int pct = EvaluateCurvePercent(smoothMax);
-                            int td = (int)Math.Round(pct * 255.0 / 100.0);
-                            _targetDuty0 = td;
-                            _targetDuty1 = td;
-                        }
-
-                        // Engage manual mode once, seeded with the CURRENT duty so nothing jumps.
-                        if (!_manualEngaged || _hwEcMode != 1)
-                        {
-                            _rampDuty0 = _fan0Duty;
-                            _rampDuty1 = _fan1Duty;
-                            string cmd = string.Format(CultureInfo.InvariantCulture, "MANUAL {0} {1}", _rampDuty0, _rampDuty1);
-                            if (_ec.SendCommand(cmd, out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
-                            {
-                                _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
-                                _lastSentDuty0 = _rampDuty0;
-                                _lastSentDuty1 = _rampDuty1;
-                                _manualEngaged = true;
-                                _lastRampUtc = DateTime.UtcNow;
-                            }
-                        }
-                    }
-
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        string modeLabel = _safetyTripped ? "SAFETY" : _cfg.Mode.ToString();
-                        string tip = string.Format("CPU {0}°C ({1} RPM) | GPU {2}°C ({3} RPM) [{4}]",
-                            _cpuTemp, _fan0Rpm, _gpuTemp, _fan1Rpm, modeLabel);
-                        if (tip.Length > 63) tip = tip.Substring(0, 63);
-                        _trayIcon.Text = tip;
-                        Invalidate();
-                    });
                 }
                 catch { }
-                finally
-                {
-                    _workerBusy = false;
-                }
-            });
+
+                if (_closing) break;
+                _wakeEvent.WaitOne(200);
+            }
         }
 
-        private void RampTick()
+        private void PollAndUpdateTargets(bool forceWrite)
         {
-            if (_workerBusy) return;
+            int ecMode, cTemp, gTemp, d0, r0, d1, r1;
+            if (_ec.SendCommand("POLL", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
+            {
+                _hwEcMode = ecMode;
+                if (cTemp > 0 && cTemp < 130) _cpuTemp = cTemp;
+                if (gTemp > 0 && gTemp < 130) _gpuTemp = gTemp;
+                _fan0Duty = d0;
+                _fan0Rpm = r0;
+                _fan1Duty = d1;
+                _fan1Rpm = r1;
+            }
+            else
+            {
+                return;
+            }
+
+            if (_ec.ConnectionGeneration != _lastSeenGeneration)
+            {
+                _lastSeenGeneration = _ec.ConnectionGeneration;
+                _manualEngaged = false;
+                _lastSentDuty0 = -1;
+                _lastSentDuty1 = -1;
+                forceWrite = true;
+            }
+
+            // Temperature smoothing for control decisions only (cards still show raw values).
+            if (_cfg.TempSmoothingEnabled && _cfg.RampMode != 2)
+            {
+                _smoothCpu = SmoothSensor(_smoothCpu, _cpuTemp);
+                _smoothGpu = SmoothSensor(_smoothGpu, _gpuTemp);
+            }
+            else
+            {
+                _smoothCpu = _cpuTemp;
+                _smoothGpu = _gpuTemp;
+            }
+
+            int rawMax = Math.Max(_cpuTemp, _gpuTemp);
+            int smoothMax = (int)Math.Round(Math.Max(_smoothCpu, _smoothGpu));
+
+            // Safety always watches the RAW temperature for the fastest possible reaction.
+            // HardSafetyTemp is an absolute floor that applies even when the user disables safety.
+            int limit = _cfg.SafetyOverrideEnabled ? _cfg.SafetyTempLimit : HardSafetyTemp;
+            if (_cfg.Mode != FanControlMode.EcAuto)
+            {
+                if (rawMax >= limit)
+                    _safetyTripped = true;
+                else if (_safetyTripped && rawMax <= limit - 5)
+                {
+                    _safetyTripped = false;
+                    forceWrite = true;
+                }
+            }
+            else
+            {
+                _safetyTripped = false;
+            }
+
+            if (_safetyTripped || _cfg.Mode == FanControlMode.EcAuto)
+            {
+                if (_hwEcMode != 0 || forceWrite)
+                {
+                    if (_ec.SendCommand("AUTO", out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
+                    {
+                        _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
+                        _rampDuty0 = d0;
+                        _rampDuty1 = d1;
+                    }
+                    _manualEngaged = false;
+                    _lastSentDuty0 = -1;
+                    _lastSentDuty1 = -1;
+                }
+            }
+            else
+            {
+                // Compute the target duty for this mode, then let StepRampOnControlThread glide to it.
+                if (_cfg.Mode == FanControlMode.FansOff)
+                {
+                    _targetDuty0 = 0;
+                    _targetDuty1 = 0;
+                }
+                else if (_cfg.Mode == FanControlMode.Manual)
+                {
+                    _targetDuty0 = (int)Math.Round(_cfg.ManualCpuPercent * 255.0 / 100.0);
+                    _targetDuty1 = (int)Math.Round((_cfg.LinkFans ? _cfg.ManualCpuPercent : _cfg.ManualGpuPercent) * 255.0 / 100.0);
+                }
+                else
+                {
+                    int pct = EvaluateCurvePercent(smoothMax);
+                    int td = (int)Math.Round(pct * 255.0 / 100.0);
+                    _targetDuty0 = td;
+                    _targetDuty1 = td;
+                }
+
+                // Engage manual mode once, seeded with the CURRENT duty so nothing jumps.
+                if (!_manualEngaged || _hwEcMode != 1)
+                {
+                    _rampDuty0 = (_cfg.RampMode == 2) ? _targetDuty0 : _fan0Duty;
+                    _rampDuty1 = (_cfg.RampMode == 2) ? _targetDuty1 : _fan1Duty;
+                    string cmd = string.Format(CultureInfo.InvariantCulture, "MANUAL {0} {1}", _rampDuty0, _rampDuty1);
+                    if (_ec.SendCommand(cmd, out ecMode, out cTemp, out gTemp, out d0, out r0, out d1, out r1))
+                    {
+                        _hwEcMode = ecMode; _fan0Duty = d0; _fan0Rpm = r0; _fan1Duty = d1; _fan1Rpm = r1;
+                        _lastSentDuty0 = _rampDuty0;
+                        _lastSentDuty1 = _rampDuty1;
+                        _manualEngaged = true;
+                        _lastRampUtc = DateTime.UtcNow;
+                    }
+                }
+            }
+        }
+
+        private void StepRampOnControlThread()
+        {
             if (!_ec.Connected) return;
             if (_safetyTripped) return;
             if (_cfg.Mode == FanControlMode.EcAuto) return;
@@ -1128,28 +1472,24 @@ namespace TufFanControl
                 _rampDuty1 = StepToward(_rampDuty1, _targetDuty1, maxUp, maxDown);
             }
 
-            if (_rampDuty0 == old0 && _rampDuty1 == old1) return;
-            if (_rampDuty0 == _lastSentDuty0 && _rampDuty1 == _lastSentDuty1) return;
+            if (_rampDuty0 == old0 && _rampDuty1 == old1 && _rampDuty0 == _lastSentDuty0 && _rampDuty1 == _lastSentDuty1)
+                return;
+            if (_rampDuty0 == _lastSentDuty0 && _rampDuty1 == _lastSentDuty1)
+                return;
 
             int send0 = _rampDuty0;
             int send1 = _rampDuty1;
-            _workerBusy = true;
-            ThreadPool.QueueUserWorkItem(delegate
+            if (_ec.SendDuty(send0, send1))
             {
-                try
-                {
-                    if (_ec.SendDuty(send0, send1))
-                    {
-                        _lastSentDuty0 = send0;
-                        _lastSentDuty1 = send1;
-                    }
-                }
-                catch { }
-                finally
-                {
-                    _workerBusy = false;
-                }
-            });
+                _lastSentDuty0 = send0;
+                _lastSentDuty1 = send1;
+                _fan0Duty = send0;
+                _fan1Duty = send1;
+            }
+            else
+            {
+                _manualEngaged = false;
+            }
         }
 
         private static int StepToward(int current, int target, double maxUp, double maxDown)
@@ -1188,7 +1528,7 @@ namespace TufFanControl
 
             string stateText;
             Color stateColor;
-            if (!_ec.Connected) { stateText = "Disconnected"; stateColor = t.AccentRed; }
+            if (!_ec.Connected) { stateText = "Reconnecting"; stateColor = t.AccentAmber; }
             else if (_safetyTripped) { stateText = "Safety Override"; stateColor = t.AccentAmber; }
             else if (_cfg.Mode == FanControlMode.EcAuto) { stateText = "BIOS Auto"; stateColor = t.AccentGreen; }
             else if (_cfg.Mode == FanControlMode.FansOff) { stateText = "0 RPM Off"; stateColor = t.AccentRed; }
@@ -1196,6 +1536,7 @@ namespace TufFanControl
             else { stateText = "Custom Curve"; stateColor = t.AccentBlue; }
 
             Rectangle statusPill = new Rectangle(pad + 142, 16, 102, 22);
+            _statusPillRect = statusPill;
             FillRoundedRect(g, statusPill, 6, Color.FromArgb(_cfg.LightMode ? 28 : 38, stateColor));
             using (Font fSt = new Font("Segoe UI", 8.2f, FontStyle.Bold))
             using (SolidBrush bSt = new SolidBrush(stateColor))
@@ -1741,6 +2082,12 @@ namespace TufFanControl
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
 
+            if (_statusPillRect.Contains(e.Location) && !_ec.Connected)
+            {
+                PollAndApplyAsync(true);
+                return;
+            }
+
             if (_themeToggleRect.Contains(e.Location))
             {
                 _cfg.LightMode = !_cfg.LightMode;
@@ -1971,7 +2318,11 @@ namespace TufFanControl
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            _pollTimer.Stop();
+            _closing = true;
+            try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+            try { _wakeEvent.Set(); } catch { }
+            try { if (_activateEvent != null) _activateEvent.Set(); } catch { }
+            try { if (_controlThread != null && _controlThread.IsAlive) _controlThread.Join(1200); } catch { }
             _trayIcon.Visible = false;
             _cfg.Save(_cfgPath);
             _ec.Shutdown(_cfg.RestoreAutoOnExit);
@@ -2019,6 +2370,9 @@ namespace TufFanControl
 
     internal static class Program
     {
+        private const string SingleInstanceMutexName = @"Global\TufFanControl_SingleInstance_Mutex";
+        private const string ActivateEventName = @"Global\TufFanControl_Activate_Event";
+
         [STAThread]
         private static void Main(string[] args)
         {
@@ -2046,18 +2400,46 @@ namespace TufFanControl
                 return;
             }
 
-            try { NativeMethods.SetProcessDPIAware(); } catch { }
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
+            bool createdNew = true;
+            Mutex instanceMutex = null;
+            EventWaitHandle activateEvent = null;
+            try
+            {
+                activateEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivateEventName);
+                instanceMutex = new Mutex(true, SingleInstanceMutexName, out createdNew);
+            }
+            catch
+            {
+                createdNew = true;
+            }
 
-            string appDir = Path.GetDirectoryName(Application.ExecutablePath);
-            string cfgPath = Path.Combine(appDir, "config.ini");
-            AppConfig cfg = AppConfig.Load(cfgPath);
+            if (!createdNew)
+            {
+                try { if (activateEvent != null) activateEvent.Set(); } catch { }
+                return;
+            }
 
-            EcBridge ec = new EcBridge();
-            ec.Start();
+            try
+            {
+                try { NativeMethods.SetProcessDPIAware(); } catch { }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
 
-            Application.Run(new MainForm(cfg, cfgPath, ec));
+                string appDir = Path.GetDirectoryName(Application.ExecutablePath);
+                string cfgPath = Path.Combine(appDir, "config.ini");
+                AppConfig cfg = AppConfig.Load(cfgPath);
+
+                EcBridge ec = new EcBridge();
+                ec.Start();
+
+                Application.Run(new MainForm(cfg, cfgPath, ec, activateEvent));
+            }
+            finally
+            {
+                try { if (instanceMutex != null) instanceMutex.ReleaseMutex(); } catch { }
+                try { if (instanceMutex != null) instanceMutex.Close(); } catch { }
+                try { if (activateEvent != null) activateEvent.Close(); } catch { }
+            }
         }
 
         private static bool IsAdministrator()

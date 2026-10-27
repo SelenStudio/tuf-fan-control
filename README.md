@@ -17,6 +17,10 @@ Lightweight, G-Helper-inspired fan controller for **ASUS TUF Gaming** laptops (t
 - **Hard thermal floor:** at **92 °C** the app always hands control back to EC Auto, even if the safety toggle is disabled or the limit slider is set lower. The safety limit slider is capped at 90 °C for the same reason.
 - **Safety Thermal Cut-In Protection:** Configurable temperature limit (`70°C` to `90°C`, default `86°C`) that automatically hands fan control back to EC Auto if CPU or GPU reaches the threshold, with a `5°C` cooldown hysteresis.
 - **Crash & Exit Safety:** Persistent `SYSTEM` worker monitors the UI process and automatically restores EC Auto (`0x31 = 0`) on exit or unexpected termination when `Auto on Exit` is enabled.
+- **Self-healing connection (v1.1):** A single transient IPC timeout used to latch the app into a permanent `Disconnected` state while the EC stayed in manual PWM. The UI now tears down the wedged worker, spawns a fresh `SYSTEM` worker, replays the command, and re-engages the active mode automatically. A 12 s dead-man timeout in the worker restores BIOS Auto if the UI ever stops polling, and the worker independently forces EC Auto at 92 °C.
+- **Serialized control loop:** One dedicated control thread (no timer/thread-pool races), `timeBeginPeriod(1)` for accurate EC timing, a cross-process mutex around composite EC register sequences, and automatic `\\.\AsusSAIO` handle re-open with driver restart on I/O failure.
+- **Single instance:** Launching the app twice focuses the existing window instead of spawning a second worker fighting over the same EC registers.
+- **Resume aware:** Re-arms the configured fan mode immediately after sleep/resume.
 - **Light & Dark Mode:** One-click theme switch with Windows 10/11 DWM titlebar synchronization and system tray integration.
 
 ## Requirements
